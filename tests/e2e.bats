@@ -478,3 +478,20 @@ EOF
   assert_output --regexp "$RULE_PRIORITY:[[:space:]]+from $RULE_SRC lookup $TABLE_ID"
 }
 
+@test "dummy interface with IPv6 subnet route" {
+  docker exec "$CLUSTER_NAME"-worker bash -c "ip link add type dummy"
+  docker exec "$CLUSTER_NAME"-worker bash -c "ip link set dev dummy0 name dummy-ipv6"
+  docker exec "$CLUSTER_NAME"-worker bash -c "ip -6 addr add fd36::3:0:e:0:0/96 dev dummy-ipv6"
+  docker exec "$CLUSTER_NAME"-worker bash -c "ip link set up dev dummy-ipv6"
+
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/deviceclass.yaml
+  kubectl apply -f "$BATS_TEST_DIRNAME"/../tests/manifests/resourceclaim_ipv6_subnet.yaml
+  kubectl wait --timeout=30s --for=condition=ready pods -l app=pod-ipv6
+
+  POD_NAME=$(kubectl get pods -l app=pod-ipv6 -o name)
+  run kubectl exec "$POD_NAME" -- ip -6 route show
+  assert_success
+  assert_output --partial "fd36::3:0:e:0:0/96 dev dummy-ipv6 proto kernel metric 256 pref medium"
+  refute_output --partial "fd36::3:0:e:0:0/96 dev dummy-ipv6 metric 1024 pref medium"
+}
+

@@ -501,9 +501,16 @@ func getRouteInfo(nlHandle nlwrap.Handle, ifName string, link netlink.Link) ([]a
 			continue
 		}
 		// Discard IPv6 link-local routes, but allow IPv4 link-local.
-		if route.Dst.IP.To4() == nil && route.Dst.IP.IsLinkLocalUnicast() {
-			klog.V(5).Infof("Skipping IPv6 link-local route %s for interface %s", route.String(), ifName)
-			continue
+		if route.Dst.IP.To4() == nil {
+			if route.Dst.IP.IsLinkLocalUnicast() {
+				klog.V(5).Infof("Skipping IPv6 link-local route %s for interface %s", route.String(), ifName)
+				continue
+			}
+			// Discard IPv6 proto=kernel routes
+			if route.Protocol == unix.RTPROT_KERNEL {
+				klog.V(5).Infof("Skipping IPv6 proto=kernel route %s for interface %s", route.String(), ifName)
+				continue
+			}
 		}
 		routeCfg.Destination = route.Dst.String()
 		if route.Gw != nil {
