@@ -72,7 +72,7 @@ image-push: ensure-buildx
 kind-cluster:
 	kind create cluster --name dra --config kind.yaml
 
-kind-image: image
+kind-image: image-build
 	docker tag ${IMAGE} registry.k8s.io/networking/dranet:stable
 	kind load docker-image registry.k8s.io/networking/dranet:stable --name dra
 	kubectl delete -f install.yaml || true
