@@ -17,10 +17,13 @@ limitations under the License.
 package driver
 
 import (
+	"encoding/json"
 	"sync"
 
 	"github.com/google/dranet/pkg/apis"
+	"github.com/google/dranet/pkg/statestore"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 )
 
 // PodConfig holds the set of configurations to be applied for a single
@@ -70,16 +73,50 @@ type LinuxDevice struct {
 // PodConfigStore provides a thread-safe, centralized store for all network device configurations
 // across multiple Pods. It is indexed by the Pod's UID, and for each Pod, it maps
 // network device names (as allocated) to their specific Config.
+// It supports an optional persistent backend via statestore.Store.
 type PodConfigStore struct {
 	mu      sync.RWMutex
 	configs map[types.UID]map[string]PodConfig
+
+	// backend is an optional persistent store. If nil, only in-memory storage is used.
+	backend statestore.Store
 }
 
-// NewPodConfigStore creates and returns a new instance of PodConfigStore.
+// NewPodConfigStore creates and returns a new instance of PodConfigStore with in-memory storage only.
 func NewPodConfigStore() *PodConfigStore {
 	return &PodConfigStore{
 		configs: make(map[types.UID]map[string]PodConfig),
 	}
+}
+
+// NewPodConfigStoreWithBackend creates a PodConfigStore backed by the provided statestore.
+// It loads any existing state from the backend on creation.
+func NewPodConfigStoreWithBackend(store statestore.Store) *PodConfigStore {
+	s := &PodConfigStore{
+		configs: make(map[types.UID]map[string]PodConfig),
+		backend: store,
+	}
+	// Load existing state from backend
+	if store != nil {
+		allConfigs, err := store.ListAllPodConfigs()
+		if err != nil {
+			klog.Errorf("Failed to load pod configs from backend: %v", err)
+		} else {
+			for podUID, deviceConfigs := range allConfigs {
+				s.configs[podUID] = make(map[string]PodConfig)
+				for deviceName, configBytes := range deviceConfigs {
+					var config PodConfig
+					if err := json.Unmarshal(configBytes, &config); err != nil {
+						klog.Errorf("Failed to unmarshal config for pod %s device %s: %v", podUID, deviceName, err)
+						continue
+					}
+					s.configs[podUID][deviceName] = config
+				}
+			}
+			klog.Infof("Loaded %d pod configs from persistent storage", len(s.configs))
+		}
+	}
+	return s
 }
 
 // Set stores the configuration for a specific device under a given Pod UID.
@@ -91,6 +128,18 @@ func (s *PodConfigStore) Set(podUID types.UID, deviceName string, config PodConf
 		s.configs[podUID] = make(map[string]PodConfig)
 	}
 	s.configs[podUID][deviceName] = config
+
+	// Persist to backend if available
+	if s.backend != nil {
+		configBytes, err := json.Marshal(config)
+		if err != nil {
+			klog.Errorf("Failed to marshal config for pod %s device %s: %v", podUID, deviceName, err)
+			return
+		}
+		if err := s.backend.SetPodConfig(podUID, deviceName, configBytes); err != nil {
+			klog.Errorf("Failed to persist config for pod %s device %s: %v", podUID, deviceName, err)
+		}
+	}
 }
 
 // Get retrieves the configuration for a specific device under a given Pod UID.
@@ -110,6 +159,13 @@ func (s *PodConfigStore) DeletePod(podUID types.UID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.configs, podUID)
+
+	// Remove from backend if available
+	if s.backend != nil {
+		if err := s.backend.DeletePod(podUID); err != nil {
+			klog.Errorf("Failed to delete pod %s from backend: %v", podUID, err)
+		}
+	}
 }
 
 // GetPodConfigs retrieves all device configurations for a given Pod UID.
@@ -146,5 +202,12 @@ func (s *PodConfigStore) DeleteClaim(claim types.NamespacedName) {
 
 	for _, uid := range podsToDelete {
 		delete(s.configs, uid)
+	}
+
+	// Remove from backend if available
+	if s.backend != nil {
+		if err := s.backend.DeletePodConfigsByClaim(claim.Namespace, claim.Name); err != nil {
+			klog.Errorf("Failed to delete configs for claim %s from backend: %v", claim, err)
+		}
 	}
 }

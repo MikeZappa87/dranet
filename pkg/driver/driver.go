@@ -26,6 +26,7 @@ import (
 	"github.com/google/cel-go/cel"
 	"github.com/google/dranet/pkg/apis"
 	"github.com/google/dranet/pkg/inventory"
+	"github.com/google/dranet/pkg/statestore"
 
 	"github.com/containerd/nri/pkg/stub"
 	"github.com/google/dranet/internal/nlwrap"
@@ -80,6 +81,13 @@ func WithInventory(db inventoryDB) Option {
 	}
 }
 
+// WithStateStore sets the state store for persisting driver state.
+func WithStateStore(store statestore.Store) Option {
+	return func(o *NetworkDriver) {
+		o.stateStore = store
+	}
+}
+
 type NetworkDriver struct {
 	driverName string
 	nodeName   string
@@ -90,6 +98,9 @@ type NetworkDriver struct {
 	// contains the host interfaces
 	netdb      inventoryDB
 	celProgram cel.Program
+
+	// stateStore for persisting state across restarts
+	stateStore statestore.Store
 
 	// Cache the rdma shared mode state
 	rdmaSharedMode bool
@@ -114,11 +125,17 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		nodeName:       nodeName,
 		kubeClient:     kubeClient,
 		rdmaSharedMode: rdmaNetnsMode == apis.RdmaNetnsModeShared,
-		podConfigStore: NewPodConfigStore(),
 	}
 
 	for _, o := range opts {
 		o(plugin)
+	}
+
+	// Initialize pod config store with state store if provided
+	if plugin.stateStore != nil {
+		plugin.podConfigStore = NewPodConfigStoreWithBackend(plugin.stateStore)
+	} else {
+		plugin.podConfigStore = NewPodConfigStore()
 	}
 
 	driverPluginPath := filepath.Join(kubeletPluginPath, driverName)

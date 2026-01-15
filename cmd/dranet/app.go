@@ -34,6 +34,7 @@ import (
 	"github.com/google/dranet/pkg/driver"
 	"github.com/google/dranet/pkg/inventory"
 	"github.com/google/dranet/pkg/pcidb"
+	"github.com/google/dranet/pkg/statestore"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/time/rate"
 
@@ -57,6 +58,8 @@ var (
 	minPollInterval  time.Duration
 	maxPollInterval  time.Duration
 	pollBurst        int
+	stateStoreType   string
+	stateStorePath   string
 
 	ready atomic.Bool
 )
@@ -69,6 +72,8 @@ func init() {
 	flag.DurationVar(&minPollInterval, "inventory-min-poll-interval", 2*time.Second, "The minimum interval between two consecutive polls of the inventory.")
 	flag.DurationVar(&maxPollInterval, "inventory-max-poll-interval", 1*time.Minute, "The maximum interval between two consecutive polls of the inventory.")
 	flag.IntVar(&pollBurst, "inventory-poll-burst", 5, "The number of polls that can be run in a burst.")
+	flag.StringVar(&stateStoreType, "state-store", "memory", "State store backend type: 'memory' (default, state lost on restart) or 'bbolt' (persistent).")
+	flag.StringVar(&stateStorePath, "state-store-path", "/var/lib/dranet/state.db", "Path to the state store file (only used when --state-store=bbolt).")
 
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n\n")
@@ -159,9 +164,29 @@ func main() {
 		}
 		opts = append(opts, driver.WithFilter(prg))
 	}
+
+	// Initialize state store
+	var storeType statestore.Type
+	switch stateStoreType {
+	case "bbolt":
+		storeType = statestore.TypeBBolt
+	default:
+		storeType = statestore.TypeMemory
+	}
+	store := statestore.New(statestore.Config{
+		Type: storeType,
+		Path: stateStorePath,
+	})
+	if err := store.Open(); err != nil {
+		klog.Fatalf("failed to open state store: %v", err)
+	}
+	defer store.Close()
+	opts = append(opts, driver.WithStateStore(store))
+
 	db := inventory.New(
 		inventory.WithRateLimiter(rate.NewLimiter(rate.Every(minPollInterval), pollBurst)),
 		inventory.WithMaxPollInterval(maxPollInterval),
+		inventory.WithStateStore(store),
 	)
 	opts = append(opts, driver.WithInventory(db))
 	dranet, err := driver.Start(ctx, driverName, clientset, nodeName, opts...)

@@ -29,6 +29,7 @@ import (
 	"github.com/google/dranet/pkg/apis"
 	"github.com/google/dranet/pkg/cloudprovider"
 	"github.com/google/dranet/pkg/names"
+	"github.com/google/dranet/pkg/statestore"
 
 	"github.com/Mellanox/rdmamap"
 	"github.com/google/dranet/internal/nlwrap"
@@ -78,6 +79,9 @@ type DB struct {
 	// The deviceStore is periodically updated by the Run method.
 	deviceStore map[string]resourceapi.Device
 
+	// stateStore is an optional persistent backend for podNetNsStore
+	stateStore statestore.Store
+
 	rateLimiter     *rate.Limiter
 	maxPollInterval time.Duration
 	notifications   chan []resourceapi.Device
@@ -98,6 +102,13 @@ func WithMaxPollInterval(d time.Duration) Option {
 	}
 }
 
+// WithStateStore sets a persistent backend for pod network namespace storage.
+func WithStateStore(store statestore.Store) Option {
+	return func(db *DB) {
+		db.stateStore = store
+	}
+}
+
 func New(opts ...Option) *DB {
 	db := &DB{
 		podNetNsStore:   map[string]string{},
@@ -109,6 +120,18 @@ func New(opts ...Option) *DB {
 	for _, o := range opts {
 		o(db)
 	}
+
+	// Load existing pod network namespaces from backend if available
+	if db.stateStore != nil {
+		podNetNs, err := db.stateStore.ListPodNetNs()
+		if err != nil {
+			klog.Errorf("Failed to load pod network namespaces from backend: %v", err)
+		} else {
+			db.podNetNsStore = podNetNs
+			klog.Infof("Loaded %d pod network namespaces from persistent storage", len(podNetNs))
+		}
+	}
+
 	return db
 }
 
@@ -122,12 +145,26 @@ func (db *DB) AddPodNetNs(pod string, netNsPath string) {
 	}
 	defer ns.Close()
 	db.podNetNsStore[pod] = netNsPath
+
+	// Persist to backend if available
+	if db.stateStore != nil {
+		if err := db.stateStore.SetPodNetNs(pod, netNsPath); err != nil {
+			klog.Errorf("Failed to persist pod %s network namespace to backend: %v", pod, err)
+		}
+	}
 }
 
 func (db *DB) RemovePodNetNs(pod string) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	delete(db.podNetNsStore, pod)
+
+	// Remove from backend if available
+	if db.stateStore != nil {
+		if err := db.stateStore.DeletePodNetNs(pod); err != nil {
+			klog.Errorf("Failed to delete pod %s network namespace from backend: %v", pod, err)
+		}
+	}
 }
 
 // GetPodNamespace allows to get the Pod network namespace
