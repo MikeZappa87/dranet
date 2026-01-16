@@ -60,6 +60,7 @@ var (
 	pollBurst        int
 	stateStoreType   string
 	stateStorePath   string
+	podUID           string
 
 	ready atomic.Bool
 )
@@ -74,6 +75,7 @@ func init() {
 	flag.IntVar(&pollBurst, "inventory-poll-burst", 5, "The number of polls that can be run in a burst.")
 	flag.StringVar(&stateStoreType, "state-store", "memory", "State store backend type: 'memory' (default, state lost on restart) or 'bbolt' (persistent).")
 	flag.StringVar(&stateStorePath, "state-store-path", "/var/lib/dranet/state.db", "Path to the state store file (only used when --state-store=bbolt).")
+	flag.StringVar(&podUID, "pod-uid", "", "The UID of the pod running this plugin. ")
 
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, "Usage: dranet [options]\n\n")
@@ -189,6 +191,7 @@ func main() {
 		inventory.WithStateStore(store),
 	)
 	opts = append(opts, driver.WithInventory(db))
+	opts = append(opts, driver.WithPodUID(podUID))
 	dranet, err := driver.Start(ctx, driverName, clientset, nodeName, opts...)
 	if err != nil {
 		klog.Fatalf("driver failed to start: %v", err)

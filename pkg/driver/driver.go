@@ -32,6 +32,8 @@ import (
 	"github.com/google/dranet/internal/nlwrap"
 
 	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
@@ -88,12 +90,20 @@ func WithStateStore(store statestore.Store) Option {
 	}
 }
 
+// WithPodUID sets the pod UID for rolling updates support.
+func WithPodUID(uid string) Option {
+	return func(o *NetworkDriver) {
+		o.podUID = uid
+	}
+}
+
 type NetworkDriver struct {
 	driverName string
 	nodeName   string
 	kubeClient kubernetes.Interface
 	draPlugin  pluginHelper
 	nriPlugin  stub.Stub
+	podUID     string
 
 	// contains the host interfaces
 	netdb      inventoryDB
@@ -134,6 +144,10 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 	// Initialize pod config store with state store if provided
 	if plugin.stateStore != nil {
 		plugin.podConfigStore = NewPodConfigStoreWithBackend(plugin.stateStore)
+		// Reconcile stored state with actual pods on this node
+		if err := plugin.reconcileStateStore(ctx); err != nil {
+			klog.Warningf("Failed to reconcile state store: %v", err)
+		}
 	} else {
 		plugin.podConfigStore = NewPodConfigStore()
 	}
@@ -221,6 +235,74 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 	go plugin.PublishResources(ctx)
 
 	return plugin, nil
+}
+
+// reconcileStateStore removes stale entries from the state store that belong to
+// pods that no longer exist on this node. This is necessary after a node restart
+// because pod UIDs and network namespace paths from the previous boot are invalid.
+func (np *NetworkDriver) reconcileStateStore(ctx context.Context) error {
+	if np.stateStore == nil {
+		return nil
+	}
+
+	// Get all pods currently running on this node from the Kubernetes API
+	pods, err := np.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + np.nodeName,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list pods on node %s: %w", np.nodeName, err)
+	}
+
+	// Build a set of active pod UIDs
+	activePodUIDs := make(map[types.UID]bool)
+	for _, pod := range pods.Items {
+		activePodUIDs[pod.UID] = true
+	}
+
+	// Clean up stale pod configs
+	storedConfigs, err := np.stateStore.ListAllPodConfigs()
+	if err != nil {
+		return fmt.Errorf("failed to list stored pod configs: %w", err)
+	}
+
+	var staleCount int
+	for podUID := range storedConfigs {
+		if !activePodUIDs[podUID] {
+			if err := np.stateStore.DeletePod(podUID); err != nil {
+				klog.Warningf("Failed to delete stale pod config for pod %s: %v", podUID, err)
+			} else {
+				staleCount++
+			}
+		}
+	}
+
+	// Clean up stale pod network namespace entries
+	storedNetNs, err := np.stateStore.ListPodNetNs()
+	if err != nil {
+		return fmt.Errorf("failed to list stored pod netns: %w", err)
+	}
+
+	var staleNetNsCount int
+	for podKey := range storedNetNs {
+		// podKey format is typically "namespace/name" or contains the pod UID
+		// We need to parse it and check if the pod still exists
+		// For now, we'll check if the netns path is still valid
+		// since after a restart, /proc/<pid>/ns/net paths are invalid
+		netNsPath, _ := np.stateStore.GetPodNetNs(podKey)
+		if _, err := os.Stat(netNsPath); os.IsNotExist(err) {
+			if err := np.stateStore.DeletePodNetNs(podKey); err != nil {
+				klog.Warningf("Failed to delete stale netns entry for pod %s: %v", podKey, err)
+			} else {
+				staleNetNsCount++
+			}
+		}
+	}
+
+	if staleCount > 0 || staleNetNsCount > 0 {
+		klog.Infof("Reconciled state store: removed %d stale pod configs and %d stale netns entries", staleCount, staleNetNsCount)
+	}
+
+	return nil
 }
 
 func (np *NetworkDriver) Stop() {

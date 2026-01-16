@@ -21,8 +21,16 @@ rules:
       - ""
     resources:
       - nodes
+      - namespaces
     verbs:
       - get
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
   - apiGroups:
       - "resource.k8s.io"
     resources:
@@ -124,12 +132,18 @@ spec:
         - /dranet
         - --v=4
         - --hostname-override=$(NODE_NAME)
+        - --state-store=bbolt
+        - --pod-uid=$(POD_UID)
         image: registry.k8s.io/networking/dranet:stable
         env:
         - name: NODE_NAME
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
         resources:
           requests:
             cpu: "100m"
@@ -156,6 +170,8 @@ spec:
         - name: bpf-programs
           mountPath: /sys/fs/bpf
           mountPropagation: HostToContainer
+        - name: state-store
+          mountPath: /var/lib/dranet
       volumes:
       - name: device-plugin
         hostPath:
@@ -178,4 +194,8 @@ spec:
       - name: bpf-programs
         hostPath:
           path: /sys/fs/bpf
+      - name: state-store
+        hostPath:
+          path: /var/lib/dranet
+          type: DirectoryOrCreate
 ---

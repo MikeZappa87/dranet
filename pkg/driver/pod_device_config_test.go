@@ -31,8 +31,8 @@ func TestNewPodConfigStore(t *testing.T) {
 	if store == nil {
 		t.Fatal("NewPodConfigStore() returned nil")
 	}
-	if store.configs == nil {
-		t.Error("NewPodConfigStore() did not initialize configs map")
+	if store.backend == nil {
+		t.Error("NewPodConfigStore() did not initialize backend")
 	}
 }
 
@@ -283,9 +283,32 @@ func TestPodConfigStore_DeleteClaim(t *testing.T) {
 			store := tt.initialConfigs()
 			store.DeleteClaim(tt.claimToDelete)
 
-			if !reflect.DeepEqual(store.configs, tt.expectedPodsAfter) {
-				t.Errorf("configs mismatch after DeleteClaim.\nGot:    %+v\nWanted: %+v", store.configs, tt.expectedPodsAfter)
+			// Verify expected pods are present with correct configs
+			for expectedPodUID, expectedDeviceConfigs := range tt.expectedPodsAfter {
+				actualConfigs, found := store.GetPodConfigs(expectedPodUID)
+				if !found {
+					t.Errorf("Expected pod %s to exist after DeleteClaim, but it was not found", expectedPodUID)
+					continue
+				}
+				if !reflect.DeepEqual(actualConfigs, expectedDeviceConfigs) {
+					t.Errorf("Pod %s configs mismatch.\nGot:    %+v\nWanted: %+v", expectedPodUID, actualConfigs, expectedDeviceConfigs)
+				}
 			}
+
+			// Verify pods that should be deleted are gone
+			allExpectedPods := make(map[types.UID]bool)
+			for podUID := range tt.expectedPodsAfter {
+				allExpectedPods[podUID] = true
+			}
+			for _, podUID := range []types.UID{podUID1, podUID2, podUID3} {
+				if !allExpectedPods[podUID] {
+					_, found := store.GetPodConfigs(podUID)
+					if found {
+						t.Errorf("Expected pod %s to be deleted after DeleteClaim, but it still exists", podUID)
+					}
+				}
+			}
+
 			if tt.checkSpecificConfig != nil {
 				tt.checkSpecificConfig(t, store)
 			}
