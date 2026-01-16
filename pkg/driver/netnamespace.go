@@ -175,3 +175,99 @@ func applyRulesConfig(containerNsPath string, rulesConfig []apis.RuleConfig) err
 	}
 	return errors.Join(errorList...)
 }
+
+// restoreHostRoutes restores routes in the host network namespace for a given interface.
+// This is called when moving a network device back from a pod namespace to the host.
+func restoreHostRoutes(ifName string, routeConfig []apis.RouteConfig) error {
+	if len(routeConfig) == 0 {
+		return nil
+	}
+
+	nhHost, err := nlwrap.NewHandle()
+	if err != nil {
+		return fmt.Errorf("could not get host netlink handle: %v", err)
+	}
+	defer nhHost.Close()
+
+	link, err := nhHost.LinkByName(ifName)
+	if err != nil {
+		return fmt.Errorf("link not found for interface %s in host namespace: %w", ifName, err)
+	}
+
+	// Bring the interface up before adding routes
+	if err := nhHost.LinkSetUp(link); err != nil {
+		return fmt.Errorf("failed to set %q up: %w", ifName, err)
+	}
+
+	errorList := []error{}
+	// Sort routes to process link-local routes before universe routes
+	slices.SortFunc(routeConfig, func(a, b apis.RouteConfig) int {
+		return int(b.Scope) - int(a.Scope)
+	})
+
+	for _, route := range routeConfig {
+		r := netlink.Route{
+			LinkIndex: link.Attrs().Index,
+			Scope:     netlink.Scope(route.Scope),
+			Table:     route.Table,
+		}
+
+		_, dst, err := net.ParseCIDR(route.Destination)
+		if err != nil {
+			errorList = append(errorList, err)
+			continue
+		}
+		r.Dst = dst
+		r.Gw = net.ParseIP(route.Gateway)
+		if route.Source != "" {
+			r.Src = net.ParseIP(route.Source)
+		}
+		if err := nhHost.RouteAdd(&r); err != nil && !errors.Is(err, syscall.EEXIST) {
+			errorList = append(errorList, fmt.Errorf("failed to restore route %s for interface %s: %w", r.String(), ifName, err))
+		}
+	}
+	return errors.Join(errorList...)
+}
+
+// restoreHostRules restores IP rules in the host network namespace.
+// This is called when moving a network device back from a pod namespace to the host.
+func restoreHostRules(rulesConfig []apis.RuleConfig) error {
+	if len(rulesConfig) == 0 {
+		return nil
+	}
+
+	nhHost, err := nlwrap.NewHandle()
+	if err != nil {
+		return fmt.Errorf("could not get host netlink handle: %v", err)
+	}
+	defer nhHost.Close()
+
+	errorList := []error{}
+	for _, ruleCfg := range rulesConfig {
+		rule := netlink.NewRule()
+		rule.Priority = ruleCfg.Priority
+		rule.Table = ruleCfg.Table
+
+		if ruleCfg.Source != "" {
+			_, src, err := net.ParseCIDR(ruleCfg.Source)
+			if err != nil {
+				errorList = append(errorList, err)
+				continue
+			}
+			rule.Src = src
+		}
+		if ruleCfg.Destination != "" {
+			_, dst, err := net.ParseCIDR(ruleCfg.Destination)
+			if err != nil {
+				errorList = append(errorList, err)
+				continue
+			}
+			rule.Dst = dst
+		}
+
+		if err := nhHost.RuleAdd(rule); err != nil && !errors.Is(err, syscall.EEXIST) {
+			errorList = append(errorList, fmt.Errorf("failed to restore rule %s: %w", rule.String(), err))
+		}
+	}
+	return errors.Join(errorList...)
+}

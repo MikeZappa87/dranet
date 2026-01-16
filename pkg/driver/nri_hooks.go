@@ -312,6 +312,21 @@ func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, 
 	for deviceName, config := range podConfig {
 		if err := nsDetachNetdev(ns, config.NetworkInterfaceConfigInPod.Interface.Name, config.NetworkInterfaceConfigInHost.Interface.Name); err != nil {
 			klog.Infof("fail to return network device %s : %v", deviceName, err)
+			continue // Skip restoring routes/rules if we couldn't move the device back
+		}
+
+		// Restore original host routes for this interface
+		if len(config.NetworkInterfaceConfigInHost.Routes) > 0 {
+			if err := restoreHostRoutes(config.NetworkInterfaceConfigInHost.Interface.Name, config.NetworkInterfaceConfigInHost.Routes); err != nil {
+				klog.Infof("fail to restore host routes for device %s : %v", deviceName, err)
+			}
+		}
+
+		// Restore original host rules
+		if len(config.NetworkInterfaceConfigInHost.Rules) > 0 {
+			if err := restoreHostRules(config.NetworkInterfaceConfigInHost.Rules); err != nil {
+				klog.Infof("fail to restore host rules for device %s : %v", deviceName, err)
+			}
 		}
 
 		if !np.rdmaSharedMode && config.RDMADevice.LinkDev != "" {
