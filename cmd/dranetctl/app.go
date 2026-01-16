@@ -25,6 +25,7 @@ import (
 	"syscall"
 
 	"github.com/google/dranet/pkg/dranetctl/gke"
+	"github.com/google/dranet/pkg/dranetctl/statestore"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"k8s.io/klog/v2"
@@ -66,4 +67,6 @@ func init() {
 	// TODO(aojea) add other cloud providers
 	// GKE subcommand
 	rootCmd.AddCommand(gke.GkeCmd)
+	// State store management
+	rootCmd.AddCommand(statestore.StateStoreCmd)
 }
