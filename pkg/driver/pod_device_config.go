@@ -98,7 +98,14 @@ func NewPodConfigStoreWithBackend(store statestore.Store) *PodConfigStore {
 
 // Set stores the configuration for a specific device under a given Pod UID.
 // If a configuration for the Pod UID or device name already exists, it will be overwritten.
+// For DRA store backends, this also registers the claim device mapping if not already done.
 func (s *PodConfigStore) Set(podUID types.UID, deviceName string, config PodConfig) {
+	// If the backend supports DRA extension, register the claim device mapping
+	// This is required for the DRA store to know where to persist the config
+	if ext, ok := s.backend.(statestore.DRAStoreExtension); ok {
+		ext.RegisterClaimDevice(podUID, deviceName, config.Claim.Namespace, config.Claim.Name, "")
+	}
+
 	configBytes, err := json.Marshal(config)
 	if err != nil {
 		klog.Errorf("Failed to marshal config for pod %s device %s: %v", podUID, deviceName, err)

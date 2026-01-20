@@ -92,7 +92,7 @@ func (np *NetworkDriver) publishResourcesPrometheusMetrics(devices []resourceapi
 }
 
 func (np *NetworkDriver) PrepareResourceClaims(ctx context.Context, claims []*resourceapi.ResourceClaim) (map[types.UID]kubeletplugin.PrepareResult, error) {
-	klog.V(2).Infof("PrepareResourceClaims is called: number of claims: %d", len(claims))
+	klog.Infof("PrepareResourceClaims is called: number of claims: %d", len(claims))
 	start := time.Now()
 	defer func() {
 		draPluginRequestsLatencySeconds.WithLabelValues(methodPrepareResourceClaims).Observe(time.Since(start).Seconds())
@@ -137,7 +137,7 @@ func (np *NetworkDriver) prepareResourceClaims(ctx context.Context, claims []*re
 //
 // TODO(#290): This function has grown too large and needs to be split apart.
 func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
-	klog.V(2).Infof("PrepareResourceClaim Claim %s/%s", claim.Namespace, claim.Name)
+	klog.Infof("PrepareResourceClaim Claim %s/%s", claim.Namespace, claim.Name)
 	start := time.Now()
 	defer func() {
 		klog.V(2).Infof("PrepareResourceClaim Claim %s/%s  took %v", claim.Namespace, claim.Name, time.Since(start))
@@ -225,6 +225,36 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		}
 		podCfg.NetworkInterfaceConfigInHost.Interface.Name = ifName
 
+		// Save the original host IP addresses so they can be restored when the device is moved back.
+		nlAddresses, err := nlHandle.AddrList(link, netlink.FAMILY_ALL)
+		if err != nil {
+			errorList = append(errorList, fmt.Errorf("fail to get ip addresses for interface %s : %w", ifName, err))
+			continue
+		}
+		for _, address := range nlAddresses {
+			// Only save IP addresses with global scope
+			if address.Scope != unix.RT_SCOPE_UNIVERSE {
+				continue
+			}
+			podCfg.NetworkInterfaceConfigInHost.Interface.Addresses = append(podCfg.NetworkInterfaceConfigInHost.Interface.Addresses, address.IPNet.String())
+		}
+
+		// Obtain the routes and rules associated with the interface.
+		// Store them in the host config so they can be restored when the device is moved back.
+		hostRoutes, hostTables, err := getRouteInfo(nlHandle, ifName, link)
+		if err != nil {
+			errorList = append(errorList, err)
+			continue
+		}
+		podCfg.NetworkInterfaceConfigInHost.Routes = hostRoutes
+
+		// Get rules for the tables associated with the interface routes
+		for _, table := range hostTables.UnsortedList() {
+			if rules, ok := rulesByTable[table]; ok {
+				podCfg.NetworkInterfaceConfigInHost.Rules = append(podCfg.NetworkInterfaceConfigInHost.Rules, rules...)
+			}
+		}
+
 		if podCfg.NetworkInterfaceConfigInPod.Interface.Name == "" {
 			// If the interface name was not explicitly overridden, use the same
 			// interface name within the pod's network namespace.
@@ -245,22 +275,8 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 				podCfg.NetworkInterfaceConfigInPod.Routes = append(podCfg.NetworkInterfaceConfigInPod.Routes, routes...)
 			}
 		} else if len(podCfg.NetworkInterfaceConfigInPod.Interface.Addresses) == 0 {
-			// If there is no custom addresses and no DHCP, then use the existing ones
-			// get the existing IP addresses
-			nlAddresses, err := nlHandle.AddrList(link, netlink.FAMILY_ALL)
-			if err != nil {
-				errorList = append(errorList, fmt.Errorf("fail to get ip addresses for interface %s : %w", ifName, err))
-			} else {
-				for _, address := range nlAddresses {
-					// Only move IP addresses with global scope because those are not host-specific, auto-configured,
-					// or have limited network scope, making them unsuitable inside the container namespace.
-					// Ref: https://www.ietf.org/rfc/rfc3549.txt
-					if address.Scope != unix.RT_SCOPE_UNIVERSE {
-						continue
-					}
-					podCfg.NetworkInterfaceConfigInPod.Interface.Addresses = append(podCfg.NetworkInterfaceConfigInPod.Interface.Addresses, address.IPNet.String())
-				}
-			}
+			// If there is no custom addresses and no DHCP, then use the saved host addresses
+			podCfg.NetworkInterfaceConfigInPod.Interface.Addresses = podCfg.NetworkInterfaceConfigInHost.Interface.Addresses
 		}
 
 		// Obtain the existing supported ethtool features and validate the config
@@ -293,15 +309,10 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			podCfg.NetworkInterfaceConfigInPod.Ethtool.Features = ethtoolFeatures
 		}
 
-		// Obtain the routes and rules associated with the interface.
-		routes, tables, err := getRouteInfo(nlHandle, ifName, link)
-		if err != nil {
-			errorList = append(errorList, err)
-			continue
-		}
-		podCfg.NetworkInterfaceConfigInPod.Routes = append(podCfg.NetworkInterfaceConfigInPod.Routes, routes...)
+		// Copy host routes to pod config (may be appended to by DHCP or user config)
+		podCfg.NetworkInterfaceConfigInPod.Routes = append(podCfg.NetworkInterfaceConfigInPod.Routes, hostRoutes...)
 
-		for _, table := range tables.UnsortedList() {
+		for _, table := range hostTables.UnsortedList() {
 			if rules, ok := rulesByTable[table]; ok {
 				klog.V(5).Infof("Adding %d rules for table %d associated with interface %s", len(rules), table, ifName)
 				podCfg.NetworkInterfaceConfigInPod.Rules = append(podCfg.NetworkInterfaceConfigInPod.Rules, rules...)
@@ -361,6 +372,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		// TODO: support for multiple pods sharing the same device
 		// we'll create the subinterface here
 		for _, uid := range podUIDs {
+			klog.Infof("PrepareResourceClaim: storing config for pod %s device %s", uid, result.Device)
 			np.podConfigStore.Set(uid, result.Device, podCfg)
 		}
 		klog.V(4).Infof("Claim Resources for pods %v : %#v", podUIDs, podCfg)

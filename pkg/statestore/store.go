@@ -15,12 +15,15 @@ limitations under the License.
 */
 
 // Package statestore provides an abstraction for persisting DRAnet state.
-// It supports both in-memory (default) and persistent (bbolt) backends,
-// allowing state to survive restarts when using the persistent backend.
+// It supports multiple backends:
+// - memory: in-memory store (default, state lost on restart)
+// - bbolt: persistent storage using bbolt database
+// - dra: uses DRA's AllocatedDeviceStatus.Data for persistence (no disk dependency)
 package statestore
 
 import (
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 )
 
 // Store defines the interface for persisting DRAnet state.
@@ -47,6 +50,18 @@ type Store interface {
 	ListAllPodConfigs() (map[types.UID]map[string][]byte, error)
 }
 
+// DRAStoreExtension provides additional methods for DRA-native state stores.
+// These methods are used to register claim/device mappings and load state from claims.
+type DRAStoreExtension interface {
+	// RegisterClaimDevice registers a mapping from (podUID, deviceName) to a ResourceClaim.
+	// This must be called during PrepareResourceClaim so the store knows where to persist data.
+	RegisterClaimDevice(podUID types.UID, deviceName string, claimNamespace, claimName, pool string)
+
+	// LoadFromClaim populates the store's cache from a ResourceClaim.
+	// This should be called during PrepareResourceClaim to restore state after driver restart.
+	LoadFromClaim(claim interface{})
+}
+
 // Type represents the type of state store backend.
 type Type string
 
@@ -55,14 +70,22 @@ const (
 	TypeMemory Type = "memory"
 	// TypeBBolt uses bbolt for persistent storage
 	TypeBBolt Type = "bbolt"
+	// TypeDRA uses DRA's AllocatedDeviceStatus.Data for persistence (no disk dependency)
+	TypeDRA Type = "dra"
 )
 
 // Config holds configuration for creating a state store.
 type Config struct {
-	// Type specifies the backend type (memory or bbolt)
+	// Type specifies the backend type (memory, bbolt, or dra)
 	Type Type
-	// Path is the file path for persistent stores (ignored for memory)
+	// Path is the file path for persistent stores (ignored for memory and dra)
 	Path string
+	// KubeClient is required for the DRA store type
+	KubeClient kubernetes.Interface
+	// DriverName is required for the DRA store type
+	DriverName string
+	// NodeName is required for the DRA store type
+	NodeName string
 }
 
 // New creates a new Store based on the provided configuration.
@@ -70,6 +93,13 @@ func New(cfg Config) Store {
 	switch cfg.Type {
 	case TypeBBolt:
 		return newBBoltStore(cfg.Path)
+	case TypeDRA:
+		return newDRAStore(DRAStoreConfig{
+			KubeClient:   cfg.KubeClient,
+			DriverName:   cfg.DriverName,
+			NodeName:     cfg.NodeName,
+			FieldManager: cfg.DriverName,
+		})
 	case TypeMemory:
 		fallthrough
 	default:

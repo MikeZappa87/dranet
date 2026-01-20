@@ -1,0 +1,75 @@
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: dummy
+spec:
+  selectors:
+    - cel:
+        expression: device.driver == "dra.net"
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: dummy-net-template
+spec:
+  spec:
+    devices:
+      requests:
+        - name: dummy-net-template
+          exactly:
+            deviceClassName: dummy
+            selectors:
+            - cel:
+                expression: device.attributes["dra.net"].ifName == "dummy0"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx-dra
+  labels:
+    app: nginx-dra
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: dra-worker
+
+  containers:
+    - name: nginx
+      image: nginx:1.27
+      ports:
+        - name: http
+          containerPort: 8080
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          cat >/etc/nginx/conf.d/default.conf <<'EOF'
+          server {
+            listen 8080;
+            server_name _;
+            location / {
+              return 200 'hello from nginx\n';
+              add_header Content-Type text/plain;
+            }
+          }
+          EOF
+          exec nginx -g 'daemon off;'
+
+  resourceClaims:
+    - name: dummy-net-interface
+      resourceClaimTemplateName: dummy-net-template
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  type: ClusterIP
+  selector:
+    app: nginx
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

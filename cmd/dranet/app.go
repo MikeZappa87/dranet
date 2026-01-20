@@ -73,7 +73,7 @@ func init() {
 	flag.DurationVar(&minPollInterval, "inventory-min-poll-interval", 2*time.Second, "The minimum interval between two consecutive polls of the inventory.")
 	flag.DurationVar(&maxPollInterval, "inventory-max-poll-interval", 1*time.Minute, "The maximum interval between two consecutive polls of the inventory.")
 	flag.IntVar(&pollBurst, "inventory-poll-burst", 5, "The number of polls that can be run in a burst.")
-	flag.StringVar(&stateStoreType, "state-store", "memory", "State store backend type: 'memory' (default, state lost on restart) or 'bbolt' (persistent).")
+	flag.StringVar(&stateStoreType, "state-store", "memory", "State store backend type: 'memory' (default, state lost on restart), 'bbolt' (persistent on disk), or 'dra' (persistent in ResourceClaim status).")
 	flag.StringVar(&stateStorePath, "state-store-path", "/var/lib/dranet/state.db", "Path to the state store file (only used when --state-store=bbolt).")
 	flag.StringVar(&podUID, "pod-uid", "", "The UID of the pod running this plugin. ")
 
@@ -172,12 +172,17 @@ func main() {
 	switch stateStoreType {
 	case "bbolt":
 		storeType = statestore.TypeBBolt
+	case "dra":
+		storeType = statestore.TypeDRA
 	default:
 		storeType = statestore.TypeMemory
 	}
 	store := statestore.New(statestore.Config{
-		Type: storeType,
-		Path: stateStorePath,
+		Type:       storeType,
+		Path:       stateStorePath,
+		KubeClient: clientset,
+		DriverName: driverName,
+		NodeName:   nodeName,
 	})
 	if err := store.Open(); err != nil {
 		klog.Fatalf("failed to open state store: %v", err)

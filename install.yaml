@@ -48,6 +48,7 @@ rules:
       - deviceclasses
     verbs:
       - get
+      - list
   - apiGroups:
       - "resource.k8s.io"
     resources:
@@ -132,7 +133,7 @@ spec:
         - /dranet
         - --v=4
         - --hostname-override=$(NODE_NAME)
-        - --state-store=bbolt
+        - --state-store=dra
         - --pod-uid=$(POD_UID)
         image: registry.k8s.io/networking/dranet:stable
         env:

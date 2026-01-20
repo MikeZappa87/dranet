@@ -18,12 +18,14 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/containerd/nri/pkg/api"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	metav1apply "k8s.io/client-go/applyconfigurations/meta/v1"
 	resourceapply "k8s.io/client-go/applyconfigurations/resource/v1"
@@ -243,6 +245,22 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 					WithLastTransitionTime(metav1.Now()),
 			)
 		}
+
+		// Include the PodConfig in the Data field for recovery after driver restart.
+		// This allows the driver to restore the config and move devices back on pod deletion.
+		podUID := types.UID(pod.GetUid())
+		configBytes, err := json.Marshal(config)
+		if err != nil {
+			klog.Warningf("RunPodSandbox failed to marshal config for device %s: %v", deviceName, err)
+		} else {
+			// Wrap the config with the pod UID as a key to support multiple pods sharing a device
+			dataWrapper := map[string]json.RawMessage{
+				string(podUID): configBytes,
+			}
+			dataBytes, _ := json.Marshal(dataWrapper)
+			resourceClaimStatusDevice.WithData(runtime.RawExtension{Raw: dataBytes})
+		}
+
 		// Ok
 		resourceClaimStatus.WithDevices(resourceClaimStatusDevice)
 	}
@@ -271,19 +289,21 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 // to avoid disrupting the pod shutdown. The kernel will do the cleanup once the namespace
 // is deleted.
 func (np *NetworkDriver) StopPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
-	klog.V(2).Infof("StopPodSandbox Pod %s/%s UID %s", pod.Namespace, pod.Name, pod.Uid)
+	klog.Infof("StopPodSandbox Pod %s/%s UID %s", pod.Namespace, pod.Name, pod.Uid)
 	start := time.Now()
 	status := statusNoop
 	defer func() {
 		nriPluginRequestsTotal.WithLabelValues(methodStopPodSandbox, status).Inc()
-		klog.V(2).Infof("StopPodSandbox Pod %s/%s UID %s took %v", pod.Namespace, pod.Name, pod.Uid, time.Since(start))
+		klog.V(2).Infof("StopPodSandbox Pod %s/%s UID %s took %v status=%s", pod.Namespace, pod.Name, pod.Uid, time.Since(start), status)
 		nriPluginRequestsLatencySeconds.WithLabelValues(methodStopPodSandbox, status).Observe(time.Since(start).Seconds())
 	}()
 	// get the devices associated to this Pod
 	podConfig, ok := np.podConfigStore.GetPodConfigs(types.UID(pod.GetUid()))
 	if !ok {
+		klog.Infof("StopPodSandbox Pod %s/%s UID %s: no pod config found in store, skipping", pod.Namespace, pod.Name, pod.Uid)
 		return nil
 	}
+	klog.Infof("StopPodSandbox Pod %s/%s UID %s: found %d device configs", pod.Namespace, pod.Name, pod.Uid, len(podConfig))
 	err := np.stopPodSandbox(ctx, pod, podConfig)
 	if err != nil {
 		status = statusFailed
@@ -295,11 +315,15 @@ func (np *NetworkDriver) StopPodSandbox(ctx context.Context, pod *api.PodSandbox
 
 func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, podConfig map[string]PodConfig) error {
 	defer func() {
+		klog.V(4).Infof("stopPodSandbox Pod %s/%s: cleaning up netdb and pod config store", pod.Namespace, pod.Name)
 		np.netdb.RemovePodNetNs(podKey(pod))
+		// Clean up pod configs from the store after successful stop
+		np.podConfigStore.DeletePod(types.UID(pod.GetUid()))
 	}()
 	// get the pod network namespace
 	ns := getNetworkNamespace(pod)
 	if ns == "" {
+		klog.V(4).Infof("stopPodSandbox Pod %s/%s: network namespace not in sandbox info, checking netdb", pod.Namespace, pod.Name)
 		// some version of containerd does not send the network namespace information on this hook so
 		// we workaround it using the local copy we have in the db to associate interfaces with Pods via
 		// the network namespace id.
@@ -308,18 +332,51 @@ func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, 
 			klog.Infof("StopPodSandbox pod %s/%s using host network ... skipping", pod.Namespace, pod.Name)
 			return nil
 		}
+		klog.V(4).Infof("stopPodSandbox Pod %s/%s: found network namespace in netdb: %s", pod.Namespace, pod.Name, ns)
 	}
+	klog.V(2).Infof("stopPodSandbox Pod %s/%s: processing %d devices in namespace %s", pod.Namespace, pod.Name, len(podConfig), ns)
 	for deviceName, config := range podConfig {
+		klog.V(2).Infof("stopPodSandbox Pod %s/%s: detaching device %s (pod iface: %s -> host iface: %s)",
+			pod.Namespace, pod.Name, deviceName,
+			config.NetworkInterfaceConfigInPod.Interface.Name,
+			config.NetworkInterfaceConfigInHost.Interface.Name)
 		if err := nsDetachNetdev(ns, config.NetworkInterfaceConfigInPod.Interface.Name, config.NetworkInterfaceConfigInHost.Interface.Name); err != nil {
 			klog.Infof("fail to return network device %s : %v", deviceName, err)
+		} else {
+			klog.V(2).Infof("stopPodSandbox Pod %s/%s: successfully detached network device %s", pod.Namespace, pod.Name, deviceName)
+
+			// Restore original host routes for this interface
+			if len(config.NetworkInterfaceConfigInHost.Routes) > 0 {
+				if err := restoreHostRoutes(config.NetworkInterfaceConfigInHost.Interface.Name, config.NetworkInterfaceConfigInHost.Routes); err != nil {
+					klog.Infof("fail to restore host routes for device %s : %v", deviceName, err)
+				}
+			}
+
+			// Restore original host rules
+			if len(config.NetworkInterfaceConfigInHost.Rules) > 0 {
+				if err := restoreHostRules(config.NetworkInterfaceConfigInHost.Rules); err != nil {
+					klog.Infof("fail to restore host rules for device %s : %v", deviceName, err)
+				}
+			}
+
+			// Restore original host IP addresses
+			if len(config.NetworkInterfaceConfigInHost.Interface.Addresses) > 0 {
+				if err := restoreHostAddresses(config.NetworkInterfaceConfigInHost.Interface.Name, config.NetworkInterfaceConfigInHost.Interface.Addresses); err != nil {
+					klog.Infof("fail to restore host addresses for device %s : %v", deviceName, err)
+				}
+			}
 		}
 
 		if !np.rdmaSharedMode && config.RDMADevice.LinkDev != "" {
+			klog.V(2).Infof("stopPodSandbox Pod %s/%s: detaching RDMA device %s", pod.Namespace, pod.Name, config.RDMADevice.LinkDev)
 			if err := nsDetachRdmadev(ns, config.RDMADevice.LinkDev); err != nil {
 				klog.Infof("fail to return rdma device %s : %v", deviceName, err)
+			} else {
+				klog.V(2).Infof("stopPodSandbox Pod %s/%s: successfully detached RDMA device %s", pod.Namespace, pod.Name, config.RDMADevice.LinkDev)
 			}
 		}
 	}
+	klog.V(2).Infof("stopPodSandbox Pod %s/%s: completed processing all devices", pod.Namespace, pod.Name)
 	return nil
 }
 
