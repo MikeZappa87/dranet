@@ -155,6 +155,42 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 
 		ifName := config.NetworkInterfaceConfigInHost.Interface.Name
 
+		// Check if this is an RDMA-only device (no network interface)
+		isRDMAOnly := ifName == "" && config.RDMADevice.LinkDev != ""
+
+		if isRDMAOnly {
+			klog.V(2).Infof("RunPodSandbox processing RDMA-only device: %s", config.RDMADevice.LinkDev)
+
+			// Move the RDMA device to the namespace if the host is in exclusive mode
+			if !np.rdmaSharedMode {
+				err := nsAttachRdmadev(config.RDMADevice.LinkDev, ns)
+				if err != nil {
+					klog.Infof("RunPodSandbox error moving RDMA device %s to namespace %s: %v", config.RDMADevice.LinkDev, ns, err)
+					return fmt.Errorf("error moving RDMA device %s to namespace %s: %v", config.RDMADevice.LinkDev, ns, err)
+				}
+				resourceClaimStatusDevice.WithConditions(
+					metav1apply.Condition().
+						WithType("RDMALinkReady").
+						WithStatus(metav1.ConditionTrue).
+						WithReason("RDMALinkReady").
+						WithLastTransitionTime(metav1.Now()),
+				)
+			} else {
+				// In shared mode, RDMA devices are already accessible
+				resourceClaimStatusDevice.WithConditions(
+					metav1apply.Condition().
+						WithType("RDMASharedReady").
+						WithStatus(metav1.ConditionTrue).
+						WithReason("RDMASharedMode").
+						WithMessage("RDMA device accessible in shared mode").
+						WithLastTransitionTime(metav1.Now()),
+				)
+			}
+
+			resourceClaimStatus.WithDevices(resourceClaimStatusDevice)
+			continue // Skip network interface handling
+		}
+
 		klog.V(2).Infof("RunPodSandbox processing Network device: %s", ifName)
 		// TODO config options to rename the device and pass parameters
 		// use https://github.com/opencontainers/runtime-spec/pull/1271

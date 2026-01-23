@@ -60,7 +60,7 @@ type pluginHelper interface {
 type inventoryDB interface {
 	Run(context.Context) error
 	GetResources(context.Context) <-chan []resourceapi.Device
-	GetNetInterfaceName(string) (string, error)
+	GetNetInterfaceName(string) (string, resourceapi.Device, error)
 	AddPodNetNs(podKey string, netNs string)
 	RemovePodNetNs(podKey string)
 	GetPodNetNs(podKey string) (netNs string)

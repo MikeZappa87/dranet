@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
@@ -52,7 +53,9 @@ func (m *fakeInventoryDB) GetResources(_ context.Context) <-chan []resourcev1.De
 	return m.resources
 }
 
-func (m *fakeInventoryDB) GetNetInterfaceName(_ string) (string, error) { return "", nil }
+func (m *fakeInventoryDB) GetNetInterfaceName(_ string) (string, resourcev1.Device, error) {
+	return "", resourcev1.Device{}, nil
+}
 
 func (m *fakeInventoryDB) AddPodNetNs(podKey string, netNs string) {
 	m.podNetNs[podKey] = netNs

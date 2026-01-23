@@ -100,31 +100,222 @@ func sriovNumVFs(name string) int {
 	return t
 }
 
-// hasRDMADeviceInSysfs checks if a network interface has RDMA capability by
-// examining the sysfs infiniband directory. This serves as a workaround for
-// cases where the rdmamap library fails to detect RDMA devices, particularly
-// for InfiniBand interfaces where the library incorrectly compares against the
-// node GUID instead of the port GUID.
-//
-// The function checks /sys/class/net/{ifname}/device/infiniband/ for any RDMA
-// device entries. If the directory exists and contains at least one entry, the
-// interface is considered RDMA-capable.
-func hasRDMADeviceInSysfs(ifName string) bool {
-	// Check if the infiniband directory exists under the device
+// getRDMADeviceNameFromSysfs returns the RDMA device name for a network interface
+// by examining the sysfs infiniband directory.
+func getRDMADeviceNameFromSysfs(ifName string) string {
 	ibPath := filepath.Join(sysnetPath, ifName, "device", "infiniband")
 	entries, err := os.ReadDir(ibPath)
 	if err != nil {
-		// Directory doesn't exist or can't be read
-		return false
+		return ""
 	}
-	// If there's at least one entry (RDMA device), return true
 	for _, entry := range entries {
 		if entry.IsDir() {
-			klog.V(4).Infof("Found RDMA device %s for interface %s via sysfs", entry.Name(), ifName)
-			return true
+			return entry.Name()
 		}
 	}
-	return false
+	return ""
+}
+
+// infinibandDevPath is the path to the infiniband device directory.
+// It can be overridden for testing.
+var infinibandDevPath = "/dev/infiniband"
+
+// ListAllUverbsDevices returns all uverbs character devices found in /dev/infiniband/.
+// This is useful for environments where uverbs devices exist but rdmamap cannot
+// map them to specific RDMA devices (e.g., mock/test environments).
+func ListAllUverbsDevices() []string {
+	return listUverbsDevicesInDir(infinibandDevPath)
+}
+
+// listUverbsDevicesInDir lists uverbs devices in the specified directory.
+func listUverbsDevicesInDir(dirPath string) []string {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		klog.V(4).Infof("Could not read %s: %v", dirPath, err)
+		return nil
+	}
+
+	var uverbsDevs []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "uverbs") {
+			uverbsDevs = append(uverbsDevs, filepath.Join(dirPath, entry.Name()))
+		}
+	}
+	return uverbsDevs
+}
+
+// sysClassInfinibandPath is the sysfs path for RDMA/InfiniBand devices.
+// Can be overridden for testing.
+var sysClassInfinibandPath = "/sys/class/infiniband"
+
+// RDMADeviceInfo contains information about an RDMA device discovered from sysfs.
+type RDMADeviceInfo struct {
+	// Name is the RDMA device name (e.g., "mlx5_0")
+	Name string
+	// NodeGUID is the InfiniBand node GUID
+	NodeGUID string
+	// NodeType is the device type: "ca" (channel adapter), "switch", "router", etc.
+	NodeType string
+	// NumPorts is the number of ports on this RDMA device
+	NumPorts int
+	// Ports contains per-port information
+	Ports []RDMAPortInfo
+	// PCIAddress is the PCI address if available
+	PCIAddress string
+	// FirmwareVersion is the device firmware version
+	FirmwareVersion string
+}
+
+// RDMAPortInfo contains information about a specific port on an RDMA device.
+type RDMAPortInfo struct {
+	// PortNum is the 1-based port number
+	PortNum int
+	// State is the port state (e.g., "ACTIVE", "DOWN")
+	State string
+	// PhysState is the physical state (e.g., "LinkUp", "Polling")
+	PhysState string
+	// LinkLayer is the link layer type: "InfiniBand" or "Ethernet" (RoCE)
+	LinkLayer string
+	// NetDev is the associated network interface name (if any)
+	NetDev string
+	// GID is the port GID (for IPoIB)
+	GID string
+}
+
+// ListRDMADevices discovers all RDMA devices from /sys/class/infiniband.
+// This allows discovering RDMA devices that may not have associated network interfaces.
+func ListRDMADevices() ([]RDMADeviceInfo, error) {
+	return listRDMADevicesInDir(sysClassInfinibandPath)
+}
+
+// listRDMADevicesInDir discovers RDMA devices from a specified sysfs path.
+func listRDMADevicesInDir(sysPath string) ([]RDMADeviceInfo, error) {
+	entries, err := os.ReadDir(sysPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			klog.V(4).Infof("No RDMA devices found: %s does not exist", sysPath)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read %s: %w", sysPath, err)
+	}
+
+	var devices []RDMADeviceInfo
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		devName := entry.Name()
+		devPath := filepath.Join(sysPath, devName)
+
+		info := RDMADeviceInfo{
+			Name: devName,
+		}
+
+		// Read node_guid
+		if data, err := os.ReadFile(filepath.Join(devPath, "node_guid")); err == nil {
+			info.NodeGUID = strings.TrimSpace(string(data))
+		}
+
+		// Read node_type
+		if data, err := os.ReadFile(filepath.Join(devPath, "node_type")); err == nil {
+			info.NodeType = strings.TrimSpace(string(data))
+		}
+
+		// Read fw_ver
+		if data, err := os.ReadFile(filepath.Join(devPath, "fw_ver")); err == nil {
+			info.FirmwareVersion = strings.TrimSpace(string(data))
+		}
+
+		// Get PCI address from device symlink
+		if deviceLink, err := os.Readlink(filepath.Join(devPath, "device")); err == nil {
+			if pciAddr, err := pciAddressFromPath(deviceLink); err == nil {
+				info.PCIAddress = pciAddr.String()
+			}
+		}
+
+		// Discover ports
+		portsPath := filepath.Join(devPath, "ports")
+		portEntries, err := os.ReadDir(portsPath)
+		if err == nil {
+			for _, portEntry := range portEntries {
+				portNum, err := strconv.Atoi(portEntry.Name())
+				if err != nil {
+					continue
+				}
+				portPath := filepath.Join(portsPath, portEntry.Name())
+				portInfo := RDMAPortInfo{PortNum: portNum}
+
+				// Read state
+				if data, err := os.ReadFile(filepath.Join(portPath, "state")); err == nil {
+					// Format: "4: ACTIVE" - extract just the state name
+					parts := strings.SplitN(strings.TrimSpace(string(data)), ":", 2)
+					if len(parts) == 2 {
+						portInfo.State = strings.TrimSpace(parts[1])
+					} else {
+						portInfo.State = strings.TrimSpace(string(data))
+					}
+				}
+
+				// Read phys_state
+				if data, err := os.ReadFile(filepath.Join(portPath, "phys_state")); err == nil {
+					parts := strings.SplitN(strings.TrimSpace(string(data)), ":", 2)
+					if len(parts) == 2 {
+						portInfo.PhysState = strings.TrimSpace(parts[1])
+					} else {
+						portInfo.PhysState = strings.TrimSpace(string(data))
+					}
+				}
+
+				// Read link_layer (InfiniBand vs Ethernet/RoCE)
+				if data, err := os.ReadFile(filepath.Join(portPath, "link_layer")); err == nil {
+					portInfo.LinkLayer = strings.TrimSpace(string(data))
+				}
+
+				// Find associated netdev by checking gid_attrs/ndevs
+				ndevsPath := filepath.Join(portPath, "gid_attrs", "ndevs")
+				if ndevEntries, err := os.ReadDir(ndevsPath); err == nil && len(ndevEntries) > 0 {
+					// Read the first ndev entry
+					if data, err := os.ReadFile(filepath.Join(ndevsPath, ndevEntries[0].Name())); err == nil {
+						portInfo.NetDev = strings.TrimSpace(string(data))
+					}
+				}
+
+				// Alternative: check via gids for the netdev
+				if portInfo.NetDev == "" {
+					gidsPath := filepath.Join(portPath, "gids")
+					if gidEntries, err := os.ReadDir(gidsPath); err == nil && len(gidEntries) > 0 {
+						if data, err := os.ReadFile(filepath.Join(gidsPath, gidEntries[0].Name())); err == nil {
+							portInfo.GID = strings.TrimSpace(string(data))
+						}
+					}
+				}
+
+				info.Ports = append(info.Ports, portInfo)
+			}
+		}
+		info.NumPorts = len(info.Ports)
+
+		devices = append(devices, info)
+	}
+
+	return devices, nil
+}
+
+// GetUverbsForRDMADevice returns the uverbs device path for an RDMA device
+// by looking up /sys/class/infiniband/<dev>/device/infiniband_verbs/.
+func GetUverbsForRDMADevice(rdmaDevName string) string {
+	verbsPath := filepath.Join(sysClassInfinibandPath, rdmaDevName, "device", "infiniband_verbs")
+	entries, err := os.ReadDir(verbsPath)
+	if err != nil {
+		return ""
+	}
+
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "uverbs") {
+			return filepath.Join(infinibandDevPath, entry.Name())
+		}
+	}
+	return ""
 }
 
 // pciAddress BDF Notation

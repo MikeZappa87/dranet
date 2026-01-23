@@ -45,4 +45,9 @@ const (
 	AttrSRIOVVfs        = AttrPrefix + "/" + "sriovVfs"
 	AttrVirtual         = AttrPrefix + "/" + "virtual"
 	AttrRDMA            = AttrPrefix + "/" + "rdma"
+	AttrRDMADeviceName  = AttrPrefix + "/" + "rdmaDeviceName" // e.g., "mlx5_0"
+	AttrRDMAUverbsDev   = AttrPrefix + "/" + "rdmaUverbsDev"  // e.g., "/dev/infiniband/uverbs0"
+	AttrRDMAPortCount   = AttrPrefix + "/" + "rdmaPortCount"  // number of ports on the RDMA device
+	AttrRDMANodeGUID    = AttrPrefix + "/" + "rdmaNodeGUID"   // InfiniBand node GUID
+	AttrRDMANodeType    = AttrPrefix + "/" + "rdmaNodeType"   // "ca" (channel adapter), "switch", "router"
 )

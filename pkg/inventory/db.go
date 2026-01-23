@@ -390,26 +390,141 @@ func addLinkAttributes(device *resourceapi.Device, link netlink.Link) {
 }
 
 func (db *DB) discoverRDMADevices(devices []resourceapi.Device) []resourceapi.Device {
+	// Build indexes of devices we already know about for quick lookup
+	pciToDeviceIdx := make(map[string]int)
+	netdevToDeviceIdx := make(map[string]int)
 	for i := range devices {
-		isRDMA := false
-		if ifName := devices[i].Attributes[apis.AttrInterfaceName].StringValue; ifName != nil && *ifName != "" {
-			// Try rdmamap library first
-			isRDMA = rdmamap.IsRDmaDeviceForNetdevice(*ifName)
-
-			// Fallback to sysfs check if rdmamap fails. This is particularly
-			// needed for InfiniBand interfaces where rdmamap has a bug comparing
-			// against node GUID instead of port GUID:
-			// https://github.com/Mellanox/rdmamap/issues/15
-			if !isRDMA {
-				isRDMA = hasRDMADeviceInSysfs(*ifName)
-			}
-		} else if pciAddr := devices[i].Attributes[apis.AttrPCIAddress].StringValue; pciAddr != nil && *pciAddr != "" {
-			rdmaDevices := rdmamap.GetRdmaDevicesForPcidev(*pciAddr)
-			isRDMA = len(rdmaDevices) != 0
+		if pciAddr := devices[i].Attributes[apis.AttrPCIAddress].StringValue; pciAddr != nil {
+			pciToDeviceIdx[*pciAddr] = i
 		}
+		if ifName := devices[i].Attributes[apis.AttrInterfaceName].StringValue; ifName != nil {
+			netdevToDeviceIdx[*ifName] = i
+		}
+	}
+
+	// Enrich existing devices with RDMA attributes
+	for i := range devices {
+		rdmaDevName := getRDMADeviceNameForDevice(&devices[i])
+		isRDMA := rdmaDevName != ""
 		devices[i].Attributes[apis.AttrRDMA] = resourceapi.DeviceAttribute{BoolValue: &isRDMA}
+
+		if isRDMA {
+			addRDMAAttributes(&devices[i], rdmaDevName)
+		}
+	}
+
+	// Discover RDMA-only devices (those without network interfaces)
+	rdmaOnlyDevices := db.discoverRDMAOnlyDevices(pciToDeviceIdx, netdevToDeviceIdx)
+	return append(devices, rdmaOnlyDevices...)
+}
+
+// getRDMADeviceNameForDevice determines the RDMA device name associated with
+// a given device. It checks network interfaces first, then falls back to PCI address.
+// Returns empty string if no RDMA device is found.
+func getRDMADeviceNameForDevice(device *resourceapi.Device) string {
+	// Try to find RDMA device by network interface name
+	if ifName := device.Attributes[apis.AttrInterfaceName].StringValue; ifName != nil && *ifName != "" {
+		// Try rdmamap library first
+		if rdmaDev, _ := rdmamap.GetRdmaDeviceForNetdevice(*ifName); rdmaDev != "" {
+			return rdmaDev
+		}
+
+		// Fallback to sysfs. This is needed for InfiniBand interfaces where
+		// rdmamap has a bug comparing node GUID instead of port GUID:
+		// https://github.com/Mellanox/rdmamap/issues/15
+		if rdmaDev := getRDMADeviceNameFromSysfs(*ifName); rdmaDev != "" {
+			return rdmaDev
+		}
+	}
+
+	// Try to find RDMA device by PCI address
+	if pciAddr := device.Attributes[apis.AttrPCIAddress].StringValue; pciAddr != nil && *pciAddr != "" {
+		if rdmaDevices := rdmamap.GetRdmaDevicesForPcidev(*pciAddr); len(rdmaDevices) > 0 {
+			return rdmaDevices[0]
+		}
+	}
+
+	return ""
+}
+
+// addRDMAAttributes adds RDMA-specific attributes to a device.
+func addRDMAAttributes(device *resourceapi.Device, rdmaDevName string) {
+	device.Attributes[apis.AttrRDMADeviceName] = resourceapi.DeviceAttribute{
+		StringValue: ptr.To(rdmaDevName),
+	}
+	if uverbsPath := GetUverbsForRDMADevice(rdmaDevName); uverbsPath != "" {
+		device.Attributes[apis.AttrRDMAUverbsDev] = resourceapi.DeviceAttribute{
+			StringValue: ptr.To(uverbsPath),
+		}
+	}
+}
+
+// discoverRDMAOnlyDevices finds RDMA devices that don't have an associated
+// network interface (pure InfiniBand devices without IPoIB).
+func (db *DB) discoverRDMAOnlyDevices(pciToDeviceIdx, netdevToDeviceIdx map[string]int) []resourceapi.Device {
+	rdmaDevices, err := ListRDMADevices()
+	if err != nil {
+		klog.V(4).Infof("Failed to list RDMA devices from sysfs: %v", err)
+		return nil
+	}
+
+	var devices []resourceapi.Device
+	for _, rdmaInfo := range rdmaDevices {
+		if isRDMADeviceAlreadyTracked(rdmaInfo, pciToDeviceIdx, netdevToDeviceIdx) {
+			continue
+		}
+
+		klog.V(4).Infof("Found RDMA-only device: %s (PCI: %s, type: %s)", rdmaInfo.Name, rdmaInfo.PCIAddress, rdmaInfo.NodeType)
+		devices = append(devices, createRDMAOnlyDevice(rdmaInfo))
 	}
 	return devices
+}
+
+// isRDMADeviceAlreadyTracked checks if an RDMA device is already represented
+// by an existing device entry (either by PCI address or network interface).
+func isRDMADeviceAlreadyTracked(rdmaInfo RDMADeviceInfo, pciToDeviceIdx, netdevToDeviceIdx map[string]int) bool {
+	if rdmaInfo.PCIAddress != "" {
+		if _, exists := pciToDeviceIdx[rdmaInfo.PCIAddress]; exists {
+			return true
+		}
+	}
+	for _, port := range rdmaInfo.Ports {
+		if port.NetDev != "" {
+			if _, exists := netdevToDeviceIdx[port.NetDev]; exists {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// createRDMAOnlyDevice creates a new device entry for an RDMA-only device.
+func createRDMAOnlyDevice(rdmaInfo RDMADeviceInfo) resourceapi.Device {
+	device := resourceapi.Device{
+		Name:       names.NormalizeInterfaceName("rdma-" + rdmaInfo.Name),
+		Attributes: make(map[resourceapi.QualifiedName]resourceapi.DeviceAttribute),
+	}
+
+	device.Attributes[apis.AttrRDMA] = resourceapi.DeviceAttribute{BoolValue: ptr.To(true)}
+	device.Attributes[apis.AttrRDMADeviceName] = resourceapi.DeviceAttribute{StringValue: ptr.To(rdmaInfo.Name)}
+
+	if rdmaInfo.NodeGUID != "" {
+		device.Attributes[apis.AttrRDMANodeGUID] = resourceapi.DeviceAttribute{StringValue: ptr.To(rdmaInfo.NodeGUID)}
+	}
+	if rdmaInfo.NodeType != "" {
+		device.Attributes[apis.AttrRDMANodeType] = resourceapi.DeviceAttribute{StringValue: ptr.To(rdmaInfo.NodeType)}
+	}
+	if rdmaInfo.NumPorts > 0 {
+		device.Attributes[apis.AttrRDMAPortCount] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(rdmaInfo.NumPorts))}
+	}
+	if rdmaInfo.PCIAddress != "" {
+		device.Attributes[apis.AttrPCIAddress] = resourceapi.DeviceAttribute{StringValue: ptr.To(rdmaInfo.PCIAddress)}
+	}
+	if uverbsPath := GetUverbsForRDMADevice(rdmaInfo.Name); uverbsPath != "" {
+		device.Attributes[apis.AttrRDMAUverbsDev] = resourceapi.DeviceAttribute{StringValue: ptr.To(uverbsPath)}
+	}
+
+	return device
 }
 
 func (db *DB) addCloudAttributes(devices []resourceapi.Device) []resourceapi.Device {
@@ -434,42 +549,38 @@ func (db *DB) updateDeviceStore(devices []resourceapi.Device) {
 	db.deviceStore = deviceStore
 }
 
-func (db *DB) GetDevice(deviceName string) (resourceapi.Device, bool) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+func (db *DB) getDevice(deviceName string) (resourceapi.Device, bool) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 	device, exists := db.deviceStore[deviceName]
 	return device, exists
 }
 
-// GetNetInterfaceName returns the network interface name for a given device. It
-// first attempts to retrieve the name from the local device store. If the
-// device is not found, it triggers a rescan of the system's devices and retries
-// the lookup. This can happen when a device was recently released by a previous
-// pod and a scan had not happened yet. This ensures that the function can find
-// newly added devices that were not present in the store at the time of the
-// initial call.
-func (db *DB) GetNetInterfaceName(deviceName string) (string, error) {
-	name, err := db.getNetInterfaceNameWithoutRescan(deviceName)
-	if err != nil {
+// GetNetInterfaceName returns the network interface name and the full device
+// for a given device name. It first attempts to retrieve from the local device
+// store. If the device is not found, it triggers a rescan of the system's
+// devices and retries. This ensures newly added devices can be found.
+//
+// Returns:
+//   - interface name (empty string if device has no network interface, e.g., RDMA-only)
+//   - the device object
+//   - error if device not found even after rescan
+func (db *DB) GetNetInterfaceName(deviceName string) (string, resourceapi.Device, error) {
+	device, exists := db.getDevice(deviceName)
+	if !exists {
 		klog.V(3).Infof("Device %q not found in local store, rescanning.", deviceName)
 		db.scan()
-		name, err = db.getNetInterfaceNameWithoutRescan(deviceName)
+		device, exists = db.getDevice(deviceName)
+		if !exists {
+			return "", resourceapi.Device{}, fmt.Errorf("device %s not found in store", deviceName)
+		}
 	}
-	return name, err
-}
 
-// getNetInterfaceNameWithoutRescan returns the network interface name for a
-// given device from the local device store without triggering a rescan if the
-// device is not found.
-func (db *DB) getNetInterfaceNameWithoutRescan(deviceName string) (string, error) {
-	device, exists := db.GetDevice(deviceName)
-	if !exists {
-		return "", fmt.Errorf("device %s not found in store", deviceName)
+	ifName := ""
+	if device.Attributes[apis.AttrInterfaceName].StringValue != nil {
+		ifName = *device.Attributes[apis.AttrInterfaceName].StringValue
 	}
-	if device.Attributes[apis.AttrInterfaceName].StringValue == nil {
-		return "", fmt.Errorf("device %s has no interface name in local store", deviceName)
-	}
-	return *device.Attributes[apis.AttrInterfaceName].StringValue, nil
+	return ifName, device, nil
 }
 
 // isNetworkDevice checks the class is 0x2, defined for all types of network controllers

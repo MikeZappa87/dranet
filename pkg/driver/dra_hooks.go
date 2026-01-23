@@ -45,6 +45,25 @@ const (
 	rdmaCmPath = "/dev/infiniband/rdma_cm"
 )
 
+// collectRDMACharDevices collects character device information for an RDMA device.
+// It returns the list of LinuxDevice for the rdma_cm device and all uverbs/issm devices
+// associated with the given RDMA device name.
+func collectRDMACharDevices(rdmaDev string) []LinuxDevice {
+	var devChars []LinuxDevice
+	charDevPaths := sets.New[string]()
+	charDevPaths.Insert(rdmaCmPath)
+	charDevPaths.Insert(rdmamap.GetRdmaCharDevices(rdmaDev)...)
+	for _, devpath := range charDevPaths.UnsortedList() {
+		dev, err := GetDeviceInfo(devpath)
+		if err != nil {
+			klog.Infof("fail to get device info for %s : %v", devpath, err)
+		} else {
+			devChars = append(devChars, dev)
+		}
+	}
+	return devChars
+}
+
 // DRA hooks exposes Network Devices to Kubernetes, the Network devices and its attributes are
 // obtained via the netdb to decouple the discovery of the interfaces with the execution.
 // The exposed devices can be allocated to one or mod pods via Claim, the Claim lifecycle is
@@ -171,7 +190,6 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 	}
 
 	var errorList []error
-	charDevices := sets.New[string]()
 	for _, result := range claim.Status.Allocation.Devices.Results {
 		// A single ResourceClaim can have devices managed by distinct DRA
 		// drivers. One common use case for this is device topology alignment
@@ -212,11 +230,37 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 			},
 			NetworkInterfaceConfigInPod: netconf,
 		}
-		ifName, err := np.netdb.GetNetInterfaceName(result.Device)
+
+		// Get the device and its network interface name (if any).
+		ifName, device, err := np.netdb.GetNetInterfaceName(result.Device)
 		if err != nil {
-			errorList = append(errorList, fmt.Errorf("failed to get network interface name for device %s: %v", result.Device, err))
+			errorList = append(errorList, fmt.Errorf("device %s not found: %v", result.Device, err))
 			continue
 		}
+
+		// Check if this is an RDMA-only device (no network interface)
+		if ifName == "" {
+			isRDMAAttr := device.Attributes[apis.AttrRDMA]
+			rdmaDevNameAttr := device.Attributes[apis.AttrRDMADeviceName]
+			if isRDMAAttr.BoolValue != nil && *isRDMAAttr.BoolValue && rdmaDevNameAttr.StringValue != nil {
+				klog.V(2).Infof("Device %s is RDMA-only (no netdev), RDMA device: %s", result.Device, *rdmaDevNameAttr.StringValue)
+
+				// For RDMA-only devices, we only need the RDMA config
+				podCfg.RDMADevice.LinkDev = *rdmaDevNameAttr.StringValue
+				podCfg.RDMADevice.DevChars = collectRDMACharDevices(podCfg.RDMADevice.LinkDev)
+
+				// Store config and continue to next device
+				for _, uid := range podUIDs {
+					np.podConfigStore.Set(uid, result.Device, podCfg)
+				}
+				klog.V(4).Infof("Claim RDMA-only resources for pods %v : %#v", podUIDs, podCfg)
+				continue
+			}
+
+			errorList = append(errorList, fmt.Errorf("device %s has no network interface and is not RDMA-capable", result.Device))
+			continue
+		}
+
 		// Get Network configuration and merge it
 		link, err := nlHandle.LinkByName(ifName)
 		if err != nil {
@@ -334,17 +378,7 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		if rdmaDev, _ := rdmamap.GetRdmaDeviceForNetdevice(ifName); rdmaDev != "" {
 			klog.V(2).Infof("RunPodSandbox processing RDMA device: %s", rdmaDev)
 			podCfg.RDMADevice.LinkDev = rdmaDev
-			// Obtain the char devices associated to the rdma device
-			charDevices.Insert(rdmaCmPath)
-			charDevices.Insert(rdmamap.GetRdmaCharDevices(rdmaDev)...)
-			for _, devpath := range charDevices.UnsortedList() {
-				dev, err := GetDeviceInfo(devpath)
-				if err != nil {
-					klog.Infof("fail to get device info for %s : %v", devpath, err)
-				} else {
-					podCfg.RDMADevice.DevChars = append(podCfg.RDMADevice.DevChars, dev)
-				}
-			}
+			podCfg.RDMADevice.DevChars = collectRDMACharDevices(rdmaDev)
 		}
 
 		// Remove the pinned programs before the NRI hooks since it
