@@ -1,5 +1,5 @@
 title = "DRANET"
-baseURL = "https://dranet.dev"
+baseURL = "https://dranet.sigs.k8s.io"
 languageCode = "en-us"
 
 # we use this to disable indexing for the non-production build
