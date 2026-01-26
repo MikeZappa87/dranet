@@ -59,7 +59,7 @@ jobs:
           npm install --save-dev autoprefixer postcss-cli
         working-directory: ./site
 
-      - run: hugo --baseURL https://dranet.dev --minify
+      - run: hugo --baseURL https://dranet.sigs.k8s.io --minify
         working-directory: ./site
 
       - name: Deploy
@@ -68,4 +68,4 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./site/public
-          cname: dranet.dev
+          cname: dranet.sigs.k8s.io
