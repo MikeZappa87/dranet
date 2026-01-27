@@ -71,7 +71,7 @@ var GkeCmd = &cobra.Command{
 
 		opts := []option.ClientOption{}
 		if authFile != "" {
-			opts = append(opts, option.WithCredentialsFile(authFile))
+			opts = append(opts, option.WithAuthCredentialsFile(option.ServiceAccount, authFile))
 		}
 
 		containerClient, err := container.NewClusterManagerClient(ctx, opts...)
