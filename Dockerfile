@@ -15,11 +15,12 @@
 # setup cross-compile env
 FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
 ARG TARGETARCH
-ARG GOARCH=${TARGETARCH} CGO_ENABLED=0
+ARG TARGETOS
+ENV GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0
 
 # cache go modules
 WORKDIR /go/src/app
-COPY go.mod go.sum .
+COPY go.mod go.sum ./
 RUN go mod download
 
 # build

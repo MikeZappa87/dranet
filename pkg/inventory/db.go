@@ -235,10 +235,10 @@ func (db *DB) discoverPCIDevices() []resourceapi.Device {
 		}
 		device.Attributes[apis.AttrPCIAddress] = resourceapi.DeviceAttribute{StringValue: &pciDev.Address}
 		if pciDev.Vendor != nil {
-			device.Attributes[apis.AttrPCIVendor] = resourceapi.DeviceAttribute{StringValue: &pciDev.Vendor.Name}
+			device.Attributes[apis.AttrPCIVendor] = resourceapi.DeviceAttribute{StringValue: ptr.To(truncateString(pciDev.Vendor.Name, 64))}
 		}
 		if pciDev.Product != nil {
-			device.Attributes[apis.AttrPCIDevice] = resourceapi.DeviceAttribute{StringValue: &pciDev.Product.Name}
+			device.Attributes[apis.AttrPCIDevice] = resourceapi.DeviceAttribute{StringValue: ptr.To(truncateString(pciDev.Product.Name, 64))}
 		}
 		if pciDev.Subsystem != nil {
 			device.Attributes[apis.AttrPCISubsystem] = resourceapi.DeviceAttribute{StringValue: &pciDev.Subsystem.ID}
@@ -587,4 +587,17 @@ func (db *DB) GetNetInterfaceName(deviceName string) (string, resourceapi.Device
 // https://pcisig.com/sites/default/files/files/PCI_Code-ID_r_1_11__v24_Jan_2019.pdf
 func isNetworkDevice(dev *ghw.PCIDevice) bool {
 	return dev.Class.ID == "02"
+}
+
+// truncateString truncates the string to the specified maximum number of bytes.
+// It ensures the truncation doesn't break UTF-8 encoding by truncating at rune boundaries.
+func truncateString(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	// Truncate and ensure we don't cut in the middle of a UTF-8 rune
+	for maxBytes > 0 && s[maxBytes-1]&0xC0 == 0x80 {
+		maxBytes--
+	}
+	return s[:maxBytes]
 }

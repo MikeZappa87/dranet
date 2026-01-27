@@ -50,23 +50,26 @@ ensure-buildx:
 # get image name from directory we're building
 IMAGE_NAME=dranet
 # docker image registry, default to upstream
-REGISTRY?=gcr.io/k8s-staging-networking
+REGISTRY?=acnpublic.azurecr.io/dranet
 # tag based on date-sha
 TAG?=$(shell echo "$$(date +v%Y%m%d)-$$(git describe --always --dirty)")
 # the full image tag
 IMAGE?=$(REGISTRY)/$(IMAGE_NAME):$(TAG)
-PLATFORMS?=linux/amd64,linux/arm64
+PLATFORMS?=linux/amd64
 
 # required to enable buildx
 export DOCKER_CLI_EXPERIMENTAL=enabled
 image-build: ensure-buildx
 	docker buildx build . \
+		--platform=linux/amd64 \
 		--tag="${IMAGE}" \
 		--load
 
 image-push: ensure-buildx
 	docker buildx build . \
+		--platform=${PLATFORMS} \
 		--tag="${IMAGE}" \
+		--no-cache \
 		--push
 
 kind-cluster:
