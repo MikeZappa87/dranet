@@ -53,6 +53,7 @@ var (
 	hostnameOverride string
 	kubeconfig       string
 	bindAddress      string
+	grpcAddress      string
 	celExpression    string
 	minPollInterval  time.Duration
 	maxPollInterval  time.Duration
@@ -64,6 +65,7 @@ var (
 func init() {
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.StringVar(&bindAddress, "bind-address", ":9177", "The IP address and port for the metrics and healthz server to serve on")
+	flag.StringVar(&grpcAddress, "grpc-address", "", "The IP address and port for the PodNetwork gRPC server (e.g., :50051). Empty disables the gRPC server.")
 	flag.StringVar(&hostnameOverride, "hostname-override", "", "If non-empty, will be used as the name of the Node that kube-network-policies is running on. If unset, the node name is assumed to be the same as the node's hostname.")
 	flag.StringVar(&celExpression, "filter", `!("dra.net/type" in attributes) || attributes["dra.net/type"].StringValue  != "veth"`, "CEL expression to filter network interface attributes (v1.DeviceAttribute).")
 	flag.DurationVar(&minPollInterval, "inventory-min-poll-interval", 2*time.Second, "The minimum interval between two consecutive polls of the inventory.")
@@ -164,6 +166,9 @@ func main() {
 		inventory.WithMaxPollInterval(maxPollInterval),
 	)
 	opts = append(opts, driver.WithInventory(db))
+	if grpcAddress != "" {
+		opts = append(opts, driver.WithGRPCServer(grpcAddress))
+	}
 	dranet, err := driver.Start(ctx, driverName, clientset, nodeName, opts...)
 	if err != nil {
 		klog.Fatalf("driver failed to start: %v", err)

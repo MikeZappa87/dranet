@@ -1,0 +1,409 @@
+/*
+	Copyright The containerd Authors.
+
+	Licensed under the Apache License, Version 2.0 (the "License");
+	you may not use this file except in compliance with the License.
+	You may obtain a copy of the License at
+
+		http://www.apache.org/licenses/LICENSE-2.0
+
+	Unless required by applicable law or agreed to in writing, software
+	distributed under the License is distributed on an "AS IS" BASIS,
+	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+	See the License for the specific language governing permissions and
+	limitations under the License.
+*/
+
+syntax = "proto3";
+
+package dranet.networking.v1;
+
+option go_package = "github.com/google/dranet/api/networking/v1;networking";
+
+// PodNetwork provides an API for managing pod-level network resources.
+service PodNetwork {
+	// GetPodResources returns resources associated with a pod sandbox.
+	rpc GetPodResources(GetPodResourcesRequest) returns (GetPodResourcesResponse);
+
+	// GetPodIPs returns the IP addresses assigned to a pod sandbox.
+	rpc GetPodIPs(GetPodIPsRequest) returns (GetPodIPsResponse);
+
+	// GetPodNetwork returns the full network state of a pod sandbox,
+	// including all interfaces, IP addresses, routes, and routing rules.
+	rpc GetPodNetwork(GetPodNetworkRequest) returns (GetPodNetworkResponse);
+
+	// MoveDevice moves a network device (netdev or RDMA) from the root
+	// network namespace into the pod sandbox's network namespace. Any IP
+	// addresses, routes, and routing rules associated with the device in
+	// the root namespace are preserved and applied in the target namespace.
+	rpc MoveDevice(MoveDeviceRequest) returns (MoveDeviceResponse);
+
+	// AssignIPAddress assigns an IP address to an interface within the
+	// pod sandbox's network namespace.
+	rpc AssignIPAddress(AssignIPAddressRequest) returns (AssignIPAddressResponse);
+
+	// ApplyRoute adds a route in the pod sandbox's network namespace.
+	rpc ApplyRoute(ApplyRouteRequest) returns (ApplyRouteResponse);
+
+	// ApplyRule adds an ip rule in the pod sandbox's network namespace.
+	rpc ApplyRule(ApplyRuleRequest) returns (ApplyRuleResponse);
+
+	// CreateNetdev creates a new Linux network device inside the pod
+	// sandbox's network namespace. Supports veth, vxlan, dummy, ipvlan,
+	// and macvlan device types.
+	rpc CreateNetdev(CreateNetdevRequest) returns (CreateNetdevResponse);
+}
+
+// DeviceType indicates the kind of device to move into the pod netns.
+enum DeviceType {
+	NETDEV = 0;
+	RDMA = 1;
+}
+
+// ———————————————————————————————————————————————
+// GetPodResources
+// ———————————————————————————————————————————————
+
+message GetPodResourcesRequest {
+	string sandbox_id = 1;
+}
+
+message GetPodResourcesResponse {
+	string pod_netns_path = 1;
+}
+
+// ———————————————————————————————————————————————
+// GetPodIPs
+// ———————————————————————————————————————————————
+
+message GetPodIPsRequest {
+	string sandbox_id = 1;
+}
+
+message PodInterfaceIPs {
+	repeated string ips = 1;
+}
+
+message PodRoute {
+	string destination = 1;
+	string gateway = 2;
+	string interface_name = 3;
+}
+
+message GetPodIPsResponse {
+	map<string, PodInterfaceIPs> interface_ips = 1;
+	repeated PodRoute routes = 2;
+}
+
+// ———————————————————————————————————————————————
+// GetPodNetwork
+// ———————————————————————————————————————————————
+
+message GetPodNetworkRequest {
+	string sandbox_id = 1;
+}
+
+// NetworkInterface describes a single interface inside the pod netns.
+message NetworkInterface {
+	// Name of the interface (e.g. "eth0", "mlx5_0").
+	string name = 1;
+
+	// MAC address of the interface.
+	string mac_address = 2;
+
+	// Device type (netdev or RDMA).
+	DeviceType type = 3;
+
+	// MTU of the interface.
+	uint32 mtu = 4;
+
+	// Operational state (e.g. "UP", "DOWN").
+	string state = 5;
+
+	// IP addresses assigned to this interface in CIDR notation (e.g. "10.0.0.2/24").
+	repeated string addresses = 6;
+}
+
+// RouteEntry describes a single route inside the pod netns.
+message RouteEntry {
+	// Destination in CIDR notation (e.g. "10.0.0.0/24", "default").
+	string destination = 1;
+
+	// Gateway address. Empty if directly connected.
+	string gateway = 2;
+
+	// Interface name this route is associated with.
+	string interface_name = 3;
+
+	// Route metric / priority.
+	uint32 metric = 4;
+
+	// Route scope (e.g. "link", "global", "host").
+	string scope = 5;
+}
+
+// RoutingRule describes an ip rule entry inside the pod netns.
+message RoutingRule {
+	// Priority of the rule.
+	uint32 priority = 1;
+
+	// Source prefix to match (CIDR), or empty for all.
+	string src = 2;
+
+	// Destination prefix to match (CIDR), or empty for all.
+	string dst = 3;
+
+	// Routing table to use (e.g. "main", "254", a custom table id).
+	string table = 4;
+
+	// Interface name to match on (iif or oif).
+	string iif = 5;
+	string oif = 6;
+}
+
+message GetPodNetworkResponse {
+	// All network interfaces inside the pod.
+	repeated NetworkInterface interfaces = 1;
+
+	// All routes inside the pod netns.
+	repeated RouteEntry routes = 2;
+
+	// All routing rules (ip rules) inside the pod netns.
+	repeated RoutingRule rules = 3;
+}
+
+// ———————————————————————————————————————————————
+// MoveDevice
+// ———————————————————————————————————————————————
+
+message MoveDeviceRequest {
+	// Sandbox to move the device into.
+	string sandbox_id = 1;
+
+	// Name of the device in the root namespace (e.g. "ens4f0", "mlx5_0").
+	string device_name = 2;
+
+	// Type of device.
+	DeviceType device_type = 3;
+
+	// Optional: rename the device inside the pod netns. If empty, keeps the
+	// original name.
+	string target_name = 4;
+}
+
+message MoveDeviceResponse {
+	// The final name of the device inside the pod netns.
+	string device_name = 1;
+
+	// IP addresses that were carried over, in CIDR notation.
+	repeated string addresses = 2;
+
+	// Routes that were carried over.
+	repeated RouteEntry routes = 3;
+
+	// Routing rules that were carried over.
+	repeated RoutingRule rules = 4;
+}
+
+// ———————————————————————————————————————————————
+// AssignIPAddress
+// ———————————————————————————————————————————————
+
+message AssignIPAddressRequest {
+	string sandbox_id = 1;
+
+	// Interface name inside the pod netns.
+	string interface_name = 2;
+
+	// IP address in CIDR notation (e.g. "10.0.0.5/24", "fd00::5/64").
+	string address = 3;
+}
+
+message AssignIPAddressResponse {}
+
+// ———————————————————————————————————————————————
+// ApplyRoute
+// ———————————————————————————————————————————————
+
+message ApplyRouteRequest {
+	string sandbox_id = 1;
+
+	// Route to apply inside the pod netns.
+	RouteEntry route = 2;
+
+	// When true, the route is applied in the host (root) network namespace
+	// instead of the pod's netns. Defaults to false (pod netns).
+	bool host_network = 3;
+}
+
+message ApplyRouteResponse {}
+
+// ———————————————————————————————————————————————
+// ApplyRule
+// ———————————————————————————————————————————————
+
+message ApplyRuleRequest {
+	string sandbox_id = 1;
+
+	// Rule to apply inside the pod netns.
+	RoutingRule rule = 2;
+
+	// When true, the rule is applied in the host (root) network namespace
+	// instead of the pod's netns. Defaults to false (pod netns).
+	bool host_network = 3;
+}
+
+message ApplyRuleResponse {}
+
+// ———————————————————————————————————————————————
+// CreateNetdev
+// ———————————————————————————————————————————————
+
+// MacvlanMode selects the forwarding behavior for macvlan devices.
+enum MacvlanMode {
+	MACVLAN_BRIDGE   = 0;
+	MACVLAN_VEPA     = 1;
+	MACVLAN_PRIVATE  = 2;
+	MACVLAN_PASSTHRU = 3;
+	MACVLAN_SOURCE   = 4;
+}
+
+// IpvlanMode selects the forwarding behavior for ipvlan devices.
+enum IpvlanMode {
+	IPVLAN_L2  = 0;
+	IPVLAN_L3  = 1;
+	IPVLAN_L3S = 2;
+}
+
+// IpvlanFlag selects the isolation mode for ipvlan devices.
+enum IpvlanFlag {
+	IPVLAN_FLAG_BRIDGE  = 0;
+	IPVLAN_FLAG_PRIVATE = 1;
+	IPVLAN_FLAG_VEPA    = 2;
+}
+
+// VethConfig creates a veth pair. One end is placed inside the pod netns
+// (named by the top-level `name` field), the other end stays in the root
+// namespace (or is moved to an optional target netns).
+message VethConfig {
+	// Name of the peer end that remains in the root (or host) namespace.
+	string peer_name = 1;
+
+	// Optional: network namespace path to place the peer end into.
+	// If empty, the peer stays in the root namespace.
+	string peer_netns_path = 2;
+
+	// Optional: bridge name to attach the peer end to.
+	// This is useful for connecting the veth to a bridge in the host namespace.
+	string peer_master = 3;
+}
+
+// VxlanConfig creates a VXLAN tunnel endpoint inside the pod netns.
+message VxlanConfig {
+	// VXLAN Network Identifier (VNI).
+	uint32 vni = 1;
+
+	// Multicast group or remote unicast IP for BUM traffic.
+	string group = 2;
+
+	// UDP destination port (default 4789 if unset).
+	uint32 port = 3;
+
+	// Name of the underlay (physical) device used for tunnel traffic.
+	// Corresponds to `ip link add ... dev <underlay_device>`.
+	string underlay_device = 4;
+
+	// Source address for outgoing packets.
+	string local = 5;
+
+	// TTL for outgoing packets. 0 means inherit.
+	uint32 ttl = 6;
+
+	// Whether to enable learning of remote MAC/IP entries.
+	bool learning = 7;
+}
+
+// DummyConfig creates a dummy interface. No additional parameters needed
+// beyond the common fields (name, mtu, addresses).
+message DummyConfig {}
+
+// IpvlanConfig creates an ipvlan subordinate device.
+message IpvlanConfig {
+	// Parent (master) interface name (e.g. "eth0").
+	string parent = 1;
+
+	// Forwarding mode.
+	IpvlanMode mode = 2;
+
+	// Isolation flag.
+	IpvlanFlag flag = 3;
+}
+
+// MacvlanConfig creates a macvlan subordinate device.
+message MacvlanConfig {
+	// Parent (master) interface name (e.g. "eth0").
+	string parent = 1;
+
+	// Forwarding mode.
+	MacvlanMode mode = 2;
+
+	// Optional: explicit MAC address. If empty, the kernel assigns one.
+	string mac_address = 3;
+}
+
+// BridgeConfig creates a Linux bridge device.
+message BridgeConfig {
+	// Enable STP (Spanning Tree Protocol). Default false.
+	bool stp_enabled = 1;
+
+	// Enable VLAN filtering on the bridge. Default false.
+	bool vlan_filtering = 2;
+
+	// Default PVID (Port VLAN ID) for ports on this bridge. 0 means use kernel default (1).
+	uint32 default_pvid = 3;
+
+	// Enable hairpin mode (allow traffic to return on the same port). Default false.
+	bool hairpin_mode = 4;
+}
+
+message CreateNetdevRequest {
+	// Sandbox to create the device in.
+	string sandbox_id = 1;
+
+	// Name of the device inside the pod netns (e.g. "eth0", "vxlan100").
+	string name = 2;
+
+	// Optional: MTU for the new device. 0 means use the kernel default.
+	uint32 mtu = 3;
+
+	// Optional: IP addresses to assign immediately after creation, in CIDR
+	// notation (e.g. "10.0.0.2/24", "fd00::2/64").
+	repeated string addresses = 4;
+
+	// When true, the device is created in the host (root) network namespace
+	// instead of the pod's netns. Useful for creating bridges and vxlan
+	// tunnels that need to exist in the host namespace.
+	bool host_network = 5;
+
+	// Optional: attach the created device to this bridge (set as master).
+	// The bridge must already exist in the target namespace.
+	string master = 6;
+
+	// Device-type-specific configuration. Exactly one must be set.
+	oneof config {
+		VethConfig    veth    = 10;
+		VxlanConfig   vxlan   = 11;
+		DummyConfig   dummy   = 12;
+		IpvlanConfig  ipvlan  = 13;
+		MacvlanConfig macvlan = 14;
+		BridgeConfig  bridge  = 15;
+	}
+}
+
+message CreateNetdevResponse {
+	// The final interface state after creation.
+	NetworkInterface interface = 1;
+
+	// For veth: the peer interface info (in whichever namespace it lives).
+	NetworkInterface peer_interface = 2;
+}

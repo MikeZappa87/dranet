@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"github.com/google/cel-go/cel"
 	"github.com/google/dranet/pkg/apis"
 	"github.com/google/dranet/pkg/inventory"
+	"google.golang.org/grpc"
 
 	"github.com/containerd/nri/pkg/stub"
 	"github.com/google/dranet/internal/nlwrap"
@@ -80,6 +82,13 @@ func WithInventory(db inventoryDB) Option {
 	}
 }
 
+// WithGRPCServer sets the gRPC server address for the PodNetwork API.
+func WithGRPCServer(addr string) Option {
+	return func(o *NetworkDriver) {
+		o.grpcAddr = addr
+	}
+}
+
 type NetworkDriver struct {
 	driverName string
 	nodeName   string
@@ -94,6 +103,10 @@ type NetworkDriver struct {
 	// Cache the rdma shared mode state
 	rdmaSharedMode bool
 	podConfigStore *PodConfigStore
+
+	// gRPC server for PodNetwork API
+	grpcAddr   string
+	grpcServer *grpc.Server
 }
 
 type Option func(*NetworkDriver)
@@ -203,12 +216,44 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 	// publish available resources
 	go plugin.PublishResources(ctx)
 
+	// Start gRPC server for PodNetwork API if configured
+	if plugin.grpcAddr != "" {
+		go plugin.startGRPCServer(ctx)
+	}
+
 	return plugin, nil
 }
 
 func (np *NetworkDriver) Stop() {
+	// Stop gRPC server if running
+	if np.grpcServer != nil {
+		np.grpcServer.GracefulStop()
+	}
 	// Stop NRI Plugin (it's expected that it returns when fully stopped).
 	np.nriPlugin.Stop()
 	// Stop DRA Plugin (returns only after it has fully stopped).
 	np.draPlugin.Stop()
+}
+
+func (np *NetworkDriver) startGRPCServer(ctx context.Context) {
+	listener, err := net.Listen("tcp", np.grpcAddr)
+	if err != nil {
+		klog.Errorf("Failed to listen on %s: %v", np.grpcAddr, err)
+		return
+	}
+
+	np.grpcServer = grpc.NewServer()
+	podNetServer := NewPodNetworkServer(np)
+	podNetServer.RegisterServer(np.grpcServer)
+
+	klog.Infof("Starting PodNetwork gRPC server on %s", np.grpcAddr)
+
+	go func() {
+		<-ctx.Done()
+		np.grpcServer.GracefulStop()
+	}()
+
+	if err := np.grpcServer.Serve(listener); err != nil {
+		klog.Errorf("gRPC server failed: %v", err)
+	}
 }
